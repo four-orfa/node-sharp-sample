@@ -1,0 +1,14 @@
+{
+  "name": "express-sharp-resize-sample",
+  "version": "1.0.0",
+  "description": "Fetch image from URL and resize it via sharp using Express",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "sharp": "^0.33.4"
+  }
+}
