@@ -4,19 +4,25 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import os from 'os';
 
-// 調整可能な設定
-const MAX_DIMENSION = 4000;             // 幅/高さの上限
-const REQUEST_TIMEOUT_MS = 8000;        // 画像取得のタイムアウト
-const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']); // SSRF対策（最低限）
-
-// sharp の並列度（デフォルト=CPU数）。状況に応じて調整してください。
+const app = express();
 sharp.concurrency(Math.min(os.cpus().length, 8));
 
-// Node18+ の fetch にタイムアウトを付与
+const MAX_DIMENSION = 4000;
+const REQUEST_TIMEOUT_MS = 8000;
+
+// ドメイン認証（必要に応じて拡張）
+const ALLOWED_DOMAIN = /^img\.example\.com$/;
+
+// S3パス部（最低1階層以上、拡張子必須）
+const S3_PATH_REGEX = /^\/([a-zA-Z0-9_\-]+\/)+[a-zA-Z0-9_\-]+\.[a-zA-Z]+$/;
+
+// S3公開URL（ベース）
+const S3_BASE_URL = 'https://img.example.com';
+
 async function fetchWithTimeout(
   resource: string,
   options: (RequestInit & { timeout?: number }) = {}
-): Promise<Response> {
+): Promise<globalThis.Response> {
   const { timeout = REQUEST_TIMEOUT_MS, ...rest } = options;
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
@@ -28,15 +34,6 @@ async function fetchWithTimeout(
   }
 }
 
-// クエリ値を string に正規化
-function qp(v: unknown): string | undefined {
-  if (v == null) return undefined;
-  if (Array.isArray(v)) return v[0] != null ? String(v[0]) : undefined;
-  if (typeof v === 'object') return undefined; // ネストは未対応（必要に応じて拡張）
-  return String(v);
-}
-
-// バリデーション/正規化
 function parseDimension(value?: string): number | undefined {
   if (value === undefined) return undefined;
   const n = Number(value);
@@ -67,32 +64,33 @@ function normalizeQuality(value?: string): number | undefined {
   return Math.max(1, Math.min(100, Math.floor(n)));
 }
 
-const app = express();
-
-// 例: GET /resize?url=...&w=800&h=600&fit=cover&format=webp&q=80
-app.get('/resize', async (req: Request, res: Response) => {
+// パス全体をキャッチする
+app.get('/*', async (req: Request, res: Response) => {
   try {
-    const imageUrl = qp(req.query.url);
-    if (!imageUrl) {
-      return res.status(400).json({ error: 'Missing required query parameter: url' });
+    // Express の req.hostname でサーバのドメインを取得
+    const host = req.hostname;
+    if (!ALLOWED_DOMAIN.test(host)) {
+      return res.status(403).json({ error: 'Forbidden domain' });
     }
 
-    // URL 検証（最低限の SSRF 対策）
-    let parsed: URL;
-    try {
-      parsed = new URL(imageUrl);
-    } catch {
-      return res.status(400).json({ error: 'Invalid url' });
-    }
-    if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
-      return res.status(400).json({ error: 'Unsupported protocol. Use http or https.' });
+    // S3パス部の検証（最低1階層以上、ファイル名+拡張子必須）
+    const s3Path = req.path; // 例: /images/product/2025/09/24/12345.jpg
+    if (!S3_PATH_REGEX.test(s3Path)) {
+      return res.status(400).json({ error: 'Invalid path format' });
     }
 
-    // 「クエリが url のみ」か（厳密）
-    const hasOnlyUrl = Object.keys(req.query).length === 1 && req.query.url !== undefined;
+    // 画像URL（S3公開URL）を組み立て
+    const imageUrl = `${S3_BASE_URL}${s3Path}`;
+
+    // クエリ取得
+    const width = parseDimension(req.query.w as string | undefined);
+    const height = parseDimension(req.query.h as string | undefined);
+    const fit = normalizeFit(req.query.fit as string | undefined);
+    const outFormat = normalizeFormat(req.query.format as string | undefined);
+    const quality = normalizeQuality(req.query.q as string | undefined);
 
     // 画像取得
-    let upstream: Response;
+    let upstream: globalThis.Response;
     try {
       upstream = await fetchWithTimeout(imageUrl);
     } catch (e: any) {
@@ -109,8 +107,9 @@ app.get('/resize', async (req: Request, res: Response) => {
         .json({ error: `Failed to fetch image: ${upstream.status} ${upstream.statusText}` });
     }
 
-    // url のみならパススルー（ストリーミングでそのまま返す）
-    if (hasOnlyUrl) {
+    // パススルー（変換パラメータなし）
+    const hasResizeParams = width || height || outFormat || req.query.fit || req.query.q;
+    if (!hasResizeParams) {
       const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
       const contentLength = upstream.headers.get('content-length');
       res.set('Content-Type', contentType);
@@ -119,31 +118,27 @@ app.get('/resize', async (req: Request, res: Response) => {
 
       if (!upstream.body) return res.status(502).end();
       try {
-        await pipeline(Readable.fromWeb(upstream.body), res);
+        await pipeline(
+          Readable.fromWeb(upstream.body as ReadableStream<any>),
+          res
+        );
         return;
       } catch (e) {
         console.error('Pass-through pipeline error:', e);
         if (!res.headersSent) res.status(502);
-        return res.end();
+        res.end();
+        return;
       }
     }
 
-    // ここから変換あり（ストリーミングで sharp に流し込む）
-    const width = parseDimension(qp(req.query.w));
-    const height = parseDimension(qp(req.query.h));
-    const fit = normalizeFit(qp(req.query.fit));
-    const outFormat = normalizeFormat(qp(req.query.format));
-    const quality = normalizeQuality(qp(req.query.q));
-
-    const transformer = sharp({ failOn: 'none' }).rotate(); // EXIFによる回転補正
-
+    // sharpによる変換
+    const transformer = sharp({ failOn: 'none' }).rotate();
     if (width || height) {
       transformer.resize(width || null, height || null, {
         fit,
         withoutEnlargement: true
       });
     }
-
     if (outFormat) {
       const fmtOpts: Record<string, unknown> = {};
       if (quality !== undefined && ['jpeg', 'png', 'webp', 'avif', 'tiff'].includes(outFormat)) {
@@ -152,7 +147,6 @@ app.get('/resize', async (req: Request, res: Response) => {
       transformer.toFormat(outFormat, fmtOpts);
     }
 
-    // 出力ヘッダ（変換あり: Content-Length は未確定なので付与しない）
     res.set('Cache-Control', 'public, max-age=3600');
     if (outFormat) {
       res.set('Content-Type', `image/${outFormat}`);
@@ -163,7 +157,11 @@ app.get('/resize', async (req: Request, res: Response) => {
 
     if (!upstream.body) return res.status(502).end();
     try {
-      await pipeline(Readable.fromWeb(upstream.body), transformer, res);
+      await pipeline(
+        Readable.fromWeb(upstream.body as ReadableStream<any>),
+        transformer,
+        res
+      );
     } catch (e) {
       console.error('Transform pipeline error:', e);
       if (!res.headersSent) res.status(500).json({ error: 'Image transform failed' });
