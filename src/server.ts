@@ -10,13 +10,14 @@ sharp.concurrency(Math.min(os.cpus().length, 8));
 const MAX_DIMENSION = 4000;
 const REQUEST_TIMEOUT_MS = 8000;
 
-// 許可ドメイン/サブドメイン（必要なら拡張）
+// ドメイン認証（必要に応じて拡張）
 const ALLOWED_DOMAIN = /^img\.example\.com$/;
-// S3パス部（英数字、スラッシュのみ、4階層、ファイル名は拡張子必須）
-const S3_PATH_REGEX = /^\/([a-zA-Z0-9_\-]+\/){4}[a-zA-Z0-9_\-]+\.[a-zA-Z]+$/;
 
-// S3画像の取得先（AWS S3のHTTP公開URL等）
-const S3_BASE_URL = 'https://img.example.com'; // S3公開URLのルート
+// S3パス部（最低1階層以上、拡張子必須）
+const S3_PATH_REGEX = /^\/([a-zA-Z0-9_\-]+\/)+[a-zA-Z0-9_\-]+\.[a-zA-Z]+$/;
+
+// S3公開URL（ベース）
+const S3_BASE_URL = 'https://img.example.com';
 
 async function fetchWithTimeout(
   resource: string,
@@ -63,8 +64,8 @@ function normalizeQuality(value?: string): number | undefined {
   return Math.max(1, Math.min(100, Math.floor(n)));
 }
 
-// すべてのリクエストを画像パスとして受ける
-app.get('/:p1/:p2/:p3/:p4/:p5/:fileName', async (req: Request, res: Response) => {
+// パス全体をキャッチする
+app.get('/*', async (req: Request, res: Response) => {
   try {
     // Express の req.hostname でサーバのドメインを取得
     const host = req.hostname;
@@ -72,7 +73,7 @@ app.get('/:p1/:p2/:p3/:p4/:p5/:fileName', async (req: Request, res: Response) =>
       return res.status(403).json({ error: 'Forbidden domain' });
     }
 
-    // パスを組み立て
+    // S3パス部の検証（最低1階層以上、ファイル名+拡張子必須）
     const s3Path = req.path; // 例: /images/product/2025/09/24/12345.jpg
     if (!S3_PATH_REGEX.test(s3Path)) {
       return res.status(400).json({ error: 'Invalid path format' });
@@ -172,7 +173,6 @@ app.get('/:p1/:p2/:p3/:p4/:p5/:fileName', async (req: Request, res: Response) =>
   }
 });
 
-// 必要に応じて 404 ハンドラ等追加
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => {
   console.log(`Image server listening on http://localhost:${port}`);
